@@ -28,9 +28,12 @@
 #include <stdarg.h>
 
 
+
+
 SX1278_hw_t SX1278_hw;
 SX1278_t SX1278;
-uint8_t buffer[20];
+uint8_t receive_packet[60] = {0};
+
 
 SPI_HandleTypeDef hspi1;
 
@@ -46,78 +49,69 @@ osSemaphoreId dataReadyHandle;
 
 void uart_printf(const char *format,...)
 {
-	char buff[128];
+	char packet[128];
 	va_list args;
 	va_start(args, format);
-	int len = vsnprintf(buff, sizeof(buff), format, args);
+	int len = vsnprintf(packet, sizeof(packet), format, args);
 	va_end(args);
 
 	if (len > 0) {
-	    if (len > sizeof(buff)) len = sizeof(buff);
-	    HAL_UART_Transmit(&huart1, (uint8_t*)buff, len, 500);
+	    if (len > sizeof(packet)) len = sizeof(packet);
+	    HAL_UART_Transmit(&huart1, (uint8_t*)packet, len, 500);
 	}
 }
 
-void send_to_esp(const char *format,...)
+void send_to_esp(uint8_t *receive_packet, uint32_t size)
 {
-	char buff[128];
-	va_list args;
-	va_start(args, format);
-	int len = vsnprintf(buff, sizeof(buff), format, args);
-	va_end(args);
-
-	if (len > 0) {
-	    if (len > sizeof(buff)) len = sizeof(buff);
-	    HAL_UART_Transmit(&huart3, (uint8_t*)buff, len, 500);
-	}
+	    HAL_UART_Transmit(&huart3,receive_packet, size, 500);
 }
-int transmit_mode(uint8_t* buffer,uint32_t size)
+int transmit_mode(uint8_t* packet,uint32_t size)
 {
     HAL_Delay(100);
-    uart_printf("Sending package...\n");
+    uart_printf("[TX] Sending package...\n");
 
     int ret = SX1278_LoRaEntryTx(&SX1278, size, 2000);
-    uart_printf("Entry: %d\n", ret);
+    uart_printf("[TX] Entry: %d\n", ret);
     if (!ret) return 0;
 
-    uart_printf("TX HEX: ");
-    for(int i=0;i<=size;i++)
-        uart_printf("%02X ", buffer[i]);
+    uart_printf("[TX] TX HEX: ");
+    for(int i=0;i<size;i++)
+        uart_printf("%02X ", packet[i]);
     uart_printf("\n");
 
-    ret = SX1278_LoRaTxPacket(&SX1278, buffer, size, 2000);
+    ret = SX1278_LoRaTxPacket(&SX1278, packet, size, 2000);
 
-    uart_printf("Transmission: %d\n", ret);
-    uart_printf("Package sent...\n");
+    uart_printf("[TX] Transmission: %d\n", ret);
+    uart_printf("[TX] Package sent...\n");
 
     return 1;
 }
 
-int receive_mode(uint8_t* buffer,uint32_t size)
+int receive_mode(uint8_t* packet,uint32_t size)
 {
     int ret;
     ret = SX1278_LoRaEntryRx(&SX1278, size, 2000);
-    uart_printf("enter receive mode: %d\n", ret);
+    uart_printf("[RX] enter receive mode: %d\n", ret);
     if (!ret) return 0;
 
     HAL_Delay(800);
 
-    uart_printf("Receiving package...\n");
+    uart_printf("[RX] Receiving package...\n");
 
     ret = SX1278_LoRaRxPacket(&SX1278);
-    uart_printf("Received: %d bytes\n", ret);
+    uart_printf("[RX] Received: %d bytes\n", ret);
 
     if (ret > 0)
     {
-        SX1278_read(&SX1278, buffer, ret);
+        SX1278_read(&SX1278, packet, ret);
 
-        uart_printf("Content HEX: ");
+        uart_printf("[RX] Content HEX: ");
         for(int i=0;i<ret;i++)
-            uart_printf("%02X ", buffer[i]);
+            uart_printf("%02X ", packet[i]);
         uart_printf("\n");
     }
 
-    uart_printf("Package received...\n");
+    uart_printf("[RX] Package received...\n");
     return ret;   // <-- IMPORTANT: return number of bytes!
 }
 
@@ -132,7 +126,109 @@ static void MX_USART3_UART_Init(void);
 void TransmitTaskInit(void const * argument);
 void ReceiveTaskInit(void const * argument);
 
-uint8_t connected_dev[6] = {0};
+uint8_t connected_dev[5] = {0x23,0x45,0x58,0x00,0x54};
+uint32_t timeout_check[5] = {0};
+uint8_t transmit_packet[7] = {0};
+
+uint32_t gateway_handle(uint8_t *rx, uint32_t size)
+{
+
+    if (size < 3)        // every packet must have at least cmd + dest + src
+        return 0;       // invalid, ignore
+
+    uint8_t cmd = rx[0];
+    uint8_t dest = rx[1];
+    uint8_t src = rx[2];
+
+
+    switch (cmd)
+    {
+    /* ============================================================
+       0x01 — CONNECT REQUEST
+       Packet: [0x01][0xFF][dev_id]
+       ============================================================*/
+    case 0x01:
+    {
+
+        if (dest != 0xFF)     // not for gateway
+            return 0;
+
+        // add device into list if needed
+        for (int i = 0; i < 5; i++)
+        {
+            if (connected_dev[i] == src)
+            {
+                uart_printf("Device %02X already connected\n", src);
+
+
+                timeout_check[i] = HAL_GetTick();
+                break;
+            }
+            else if (connected_dev[i] == 0)
+            {
+                connected_dev[i] = src;
+
+                timeout_check[i] = HAL_GetTick();
+                uart_printf("Added dev %02X\n", src);
+                break;
+            }
+        }
+
+        // Build reply packet: [0x01][0xFF][dev0][dev1][dev2][dev3][dev4]
+        transmit_packet[0] = 0x01;
+        transmit_packet[1] = 0xFF;
+        for (int i = 0; i < 5; i++)
+            transmit_packet[2 + i] = connected_dev[i];
+
+        return 2 + 5;  // = 7 bytes
+    }
+
+    /* ============================================================
+       0x02 — SENSOR DATA FROM NODE
+       Packet: [0x02][0xFF][dev_id][data...]
+       ============================================================*/
+    case 0x02:
+    {
+        if (dest != 0xFF)
+            return 0;
+        for (int i = 0;i < 5;i++)
+        {
+        	if (connected_dev[i] == src)
+        	{
+
+        		timeout_check[i] = HAL_GetTick();
+        		send_to_esp(rx, size);  // relay packet to ESP
+        		break;
+        	}
+        }
+
+        return size;             // forward as-is
+    }
+
+    default:
+        return 0;  // unknown command
+    }
+}
+
+void gateway_timeout_check(uint32_t timeout_ms)
+{
+     uint32_t now = HAL_GetTick();
+
+    for (int i = 0; i < 5; i++)
+    {
+        if (connected_dev[i] != 0 )
+        {
+            if ((now - timeout_check[i]) > timeout_ms)
+            {
+                uart_printf("Device %02X OFFLINE\n", connected_dev[i]);
+
+                timeout_check[i] = 0;
+
+                connected_dev[i] = 0x00;   // optional: remove
+            }
+        }
+    }
+}
 
 int main(void)
 {
@@ -401,35 +497,57 @@ static void MX_GPIO_Init(void)
 /* USER CODE END Header_TransmitTaskInit */
 void TransmitTaskInit(void const * argument)
 {
+    while (1)
+    {
+        // Wait for packet ready
+        if (osSemaphoreWait(dataReadyHandle, osWaitForever) != osOK)
+            continue;
 
-	while(1)
-  {
-		int ret;
-		connected_dev[0] = 0x01;
-		connected_dev[1] = 0xFF;
-		ret = transmit_mode(connected_dev,6);
-		uart_printf("sending ack: %d\n",ret);
-		osSemaphoreRelease(dataReadyHandle);
-    osDelay(1000);
-  }
+        transmit_packet[0] = 0x01;
+        transmit_packet[1] = 0xFF;
+        for (int i=2;i<7;i++)
+        {
+        	transmit_packet[i] = connected_dev[i-2];
+        }
 
+        int ret = transmit_mode(transmit_packet, 7);
+        uart_printf("[TX] sending ack: %d\n", ret);
+
+        // Allow ReceiveTask to run next
+        osSemaphoreRelease(dataReadyHandle);
+        osDelay(200);
+    }
 }
+
 
 
 void ReceiveTaskInit(void const * argument)
 {
+    int ret;
 
-  while(1)
-  { if(osSemaphoreWait(dataReadyHandle, osWaitForever) == osOK){
-	  int ret;
-	  ret = receive_mode(buffer, sizeof(buffer));
-	  connected_dev[2]=buffer[2];
-	  uart_printf("receive: %d\n",ret);
-	    osDelay(100);
-  }
-  }
-  /* USER CODE END ReceiveTaskInit */
+    while (1)
+    {
+        if (osSemaphoreWait(dataReadyHandle, osWaitForever) != osOK)
+            continue;
+
+        ret = receive_mode(receive_packet, sizeof(receive_packet));
+        uart_printf("[RX] receive: %d\n", ret);
+
+        if (ret > 0)
+        {
+            gateway_handle(receive_packet, ret);
+
+        }
+        else
+        {
+            uart_printf("[RX] receive failed\n");
+        }
+        gateway_timeout_check(10000);
+        osSemaphoreRelease(dataReadyHandle);
+        osDelay(200);
+    }
 }
+
 
 /**
   * @brief  Period elapsed callback in non blocking mode
