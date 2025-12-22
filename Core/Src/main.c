@@ -68,7 +68,6 @@ void send_to_esp(uint8_t *receive_packet, uint32_t size)
 int transmit_mode(uint8_t* packet,uint32_t size)
 {
     HAL_Delay(100);
-    uart_printf("[TX] Sending package...\n");
 
     int ret = SX1278_LoRaEntryTx(&SX1278, size, 2000);
     uart_printf("[TX] Entry: %d\n", ret);
@@ -82,7 +81,7 @@ int transmit_mode(uint8_t* packet,uint32_t size)
     ret = SX1278_LoRaTxPacket(&SX1278, packet, size, 2000);
 
     uart_printf("[TX] Transmission: %d\n", ret);
-    uart_printf("[TX] Package sent...\n");
+
 
     return 1;
 }
@@ -94,9 +93,9 @@ int receive_mode(uint8_t* packet,uint32_t size)
     uart_printf("[RX] enter receive mode: %d\n", ret);
     if (!ret) return 0;
 
-    HAL_Delay(800);
+    HAL_Delay(500);
 
-    uart_printf("[RX] Receiving package...\n");
+
 
     ret = SX1278_LoRaRxPacket(&SX1278);
     uart_printf("[RX] Received: %d bytes\n", ret);
@@ -104,14 +103,13 @@ int receive_mode(uint8_t* packet,uint32_t size)
     if (ret > 0)
     {
         SX1278_read(&SX1278, packet, ret);
-
         uart_printf("[RX] Content HEX: ");
         for(int i=0;i<ret;i++)
             uart_printf("%02X ", packet[i]);
         uart_printf("\n");
     }
 
-    uart_printf("[RX] Package received...\n");
+
     return ret;   // <-- IMPORTANT: return number of bytes!
 }
 
@@ -133,13 +131,11 @@ uint8_t transmit_packet[7] = {0};
 uint32_t gateway_handle(uint8_t *rx, uint32_t size)
 {
 
-    if (size < 3)        // every packet must have at least cmd + dest + src
+    if (size < 2)        // every packet must have at least cmd + dest + src
         return 0;       // invalid, ignore
 
     uint8_t cmd = rx[0];
-    uint8_t dest = rx[1];
-    uint8_t src = rx[2];
-
+    uint8_t src = rx[1];
 
     switch (cmd)
     {
@@ -149,10 +145,6 @@ uint32_t gateway_handle(uint8_t *rx, uint32_t size)
        ============================================================*/
     case 0x01:
     {
-
-        if (dest != 0xFF)     // not for gateway
-            return 0;
-
         // add device into list if needed
         for (int i = 0; i < 5; i++)
         {
@@ -173,14 +165,7 @@ uint32_t gateway_handle(uint8_t *rx, uint32_t size)
                 break;
             }
         }
-
-        // Build reply packet: [0x01][0xFF][dev0][dev1][dev2][dev3][dev4]
-        transmit_packet[0] = 0x01;
-        transmit_packet[1] = 0xFF;
-        for (int i = 0; i < 5; i++)
-            transmit_packet[2 + i] = connected_dev[i];
-
-        return 2 + 5;  // = 7 bytes
+        return 6;  // = 7 bytes
     }
 
     /* ============================================================
@@ -189,21 +174,46 @@ uint32_t gateway_handle(uint8_t *rx, uint32_t size)
        ============================================================*/
     case 0x02:
     {
-        if (dest != 0xFF)
-            return 0;
+
         for (int i = 0;i < 5;i++)
         {
         	if (connected_dev[i] == src)
         	{
 
         		timeout_check[i] = HAL_GetTick();
-        		send_to_esp(rx, size);  // relay packet to ESP
+        		uint8_t buff[9];
+        		for (int j = 0; j < 9;j++)
+        		{
+        			buff[j] = rx[j+1];
+        		}
+        		send_to_esp(buff, 9);  // relay packet to ESP
         		break;
         	}
         }
 
-        return size;             // forward as-is
+        return 10;             // forward as-is
     }
+    case 0x20:
+        {
+
+            for (int i = 0;i < 5;i++)
+            {
+            	if (connected_dev[i] == src)
+            	{
+
+            		timeout_check[i] = HAL_GetTick();
+            		uint8_t buff[9];
+            		for (int j = 0; j < 9;j++)
+            		{
+            			buff[j] = rx[j+2];
+            		}
+            		send_to_esp(buff, 9);  // relay packet to ESP
+            		break;
+            	}
+            }
+
+            return 11;             // forward as-is
+        }
 
     default:
         return 0;  // unknown command
@@ -269,19 +279,19 @@ int main(void)
      	SX1278.hw = &SX1278_hw;
 
      	uart_printf("Configuring LoRa module\r\n");
-     	SX1278_init(&SX1278, 434000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
-     	SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 10);
+     	SX1278_init(&SX1278, 434000000, SX1278_POWER_20DBM, SX1278_LORA_SF_10,
+     	    	SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_7, SX1278_LORA_CRC_EN, 15);
      	uart_printf("Done configuring LoRaModule\r\n");
      	SX1278_LoRaEntryTx(&SX1278, 16, 2000);
 
      	osSemaphoreDef(dataReady);
      	  dataReadyHandle = osSemaphoreCreate(osSemaphore(dataReady), 1);
   /* definition and creation of TransmitTask */
-  osThreadDef(TransmitTask, TransmitTaskInit, osPriorityNormal, 0, 256);
+  osThreadDef(TransmitTask, TransmitTaskInit, 0, 0, 220);
   TransmitTaskHandle = osThreadCreate(osThread(TransmitTask), NULL);
 
   /* definition and creation of ReceiveTask */
-  osThreadDef(ReceiveTask, ReceiveTaskInit, osPriorityBelowNormal, 0, 256);
+  osThreadDef(ReceiveTask, ReceiveTaskInit, -1, 0, 380);
   ReceiveTaskHandle = osThreadCreate(osThread(ReceiveTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -504,18 +514,17 @@ void TransmitTaskInit(void const * argument)
             continue;
 
         transmit_packet[0] = 0x01;
-        transmit_packet[1] = 0xFF;
-        for (int i=2;i<7;i++)
+        for (int i=1;i<6;i++)
         {
-        	transmit_packet[i] = connected_dev[i-2];
+        	transmit_packet[i] = connected_dev[i-1];
         }
 
-        int ret = transmit_mode(transmit_packet, 7);
-        uart_printf("[TX] sending ack: %d\n", ret);
+        int ret = transmit_mode(transmit_packet, 6);
+
 
         // Allow ReceiveTask to run next
         osSemaphoreRelease(dataReadyHandle);
-        osDelay(200);
+        osDelay(500);
     }
 }
 
@@ -542,7 +551,7 @@ void ReceiveTaskInit(void const * argument)
         {
             uart_printf("[RX] receive failed\n");
         }
-        gateway_timeout_check(10000);
+        gateway_timeout_check(600000);
         osSemaphoreRelease(dataReadyHandle);
         osDelay(200);
     }
