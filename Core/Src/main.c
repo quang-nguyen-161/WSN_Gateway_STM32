@@ -1,49 +1,51 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
-#include "main.h"
-#include "cmsis_os.h"
 
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
-#include "SX1278.h"
+#include "main.h"
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <stdbool.h>
 
+#include "SX1278.h"
 
+#define MAX_TX_PACKET_SIZE   60  // adjust as needed
+#define MAX_RX_PACKET_SIZE   60
+#define SENSOR_PACKET_LEN   8    // sensor fields you copy into TX (3..10 -> 8 bytes)
+#define CONNECTED_NODE_COUNT 5
+
+#define dev_id 0xFF //gateway
+
+#define GATEWAY_ADV_CMD 0x22
+#define SENSOR_PACKET_CMD 0x02
+#define FORWARD_PACKET_CMD 0x20
+#define CONNECT_GATEWAY_CMD 0X01
+#define CONNECT_NODE_CMD 0X10
+#define NODE_ADV_CMD 0X11
+#define GATEWAY_BEACON_CMD 0X33
+#define NODE_BEACON (dev_id | 0x33)
+
+uint8_t frame = 0;
+uint8_t connected_dev[5] = {0x25,0x12,0x00,0x45,0x32};
+uint32_t timeout_check[5] = {0};
+uint8_t transmit_packet[7] = {0};
+uint8_t receive_packet[60] = {0};
+uint8_t frame_count[5] = {0};
+#define TDMA_SLOT_TIME 2000 //2s
+#define TDMA_GUARD_TIME 200
+#define TDMA_TX_TIME    1600
 
 
 SX1278_hw_t SX1278_hw;
 SX1278_t SX1278;
-uint8_t receive_packet[60] = {0};
-
 
 SPI_HandleTypeDef hspi1;
+
+TIM_HandleTypeDef htim1;
 
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart3;
 
-osThreadId TransmitTaskHandle;
-osThreadId ReceiveTaskHandle;
-
-osSemaphoreId dataReadyHandle;
 /* USER CODE BEGIN PV */
 
 
@@ -65,160 +67,130 @@ void send_to_esp(uint8_t *receive_packet, uint32_t size)
 {
 	    HAL_UART_Transmit(&huart3,receive_packet, size, 500);
 }
-int transmit_mode(uint8_t* packet,uint32_t size)
-{
-    HAL_Delay(100);
 
-    int ret = SX1278_LoRaEntryTx(&SX1278, size, 2000);
-    uart_printf("[TX] Entry: %d\n", ret);
-    if (!ret) return 0;
+
+uint8_t tx_mode_start(uint32_t max_size, uint32_t timeout)
+{
+    uint8_t ret = SX1278_LoRaEntryTx(&SX1278, max_size, timeout);
+    uart_printf("[TX] Entry TX: %d\n", ret);
+    return ret;
+}
+
+uint8_t tx_mode_send(uint8_t *packet, uint32_t size, uint32_t timeout)
+{
+    uint8_t ret;
 
     uart_printf("[TX] TX HEX: ");
-    for(int i=0;i<size;i++)
+    for (uint32_t i = 0; i < size; i++)
         uart_printf("%02X ", packet[i]);
     uart_printf("\n");
 
-    ret = SX1278_LoRaTxPacket(&SX1278, packet, size, 2000);
+    ret = SX1278_LoRaTxPacket(&SX1278, packet, size, timeout);
+    uart_printf("[TX] Transmit: %d\n", ret);
 
-    uart_printf("[TX] Transmission: %d\n", ret);
-
-
-    return 1;
+    return ret;
 }
 
-int receive_mode(uint8_t* packet,uint32_t size)
+
+uint8_t rx_mode_start(uint32_t max_size, uint32_t timeout)
 {
-    int ret;
-    ret = SX1278_LoRaEntryRx(&SX1278, size, 2000);
-    uart_printf("[RX] enter receive mode: %d\n", ret);
-    if (!ret) return 0;
+    uint8_t ret = SX1278_LoRaEntryRx(&SX1278, max_size, timeout);
+    uart_printf("[RX] Entry RX: %d\n", ret);
+    return ret;
+}
 
-    HAL_Delay(500);
-
-
-
+uint8_t rx_mode_standby(uint8_t *packet)
+{
+    uint8_t ret;
+    HAL_Delay(200);
     ret = SX1278_LoRaRxPacket(&SX1278);
-    uart_printf("[RX] Received: %d bytes\n", ret);
-
     if (ret > 0)
     {
         SX1278_read(&SX1278, packet, ret);
-        uart_printf("[RX] Content HEX: ");
-        for(int i=0;i<ret;i++)
+
+        uart_printf("[RX] Content: ");
+        for (uint8_t i = 0; i < ret; i++)
             uart_printf("%02X ", packet[i]);
         uart_printf("\n");
+
+        return ret;
     }
 
-
-    return ret;   // <-- IMPORTANT: return number of bytes!
+    return 0;
 }
 
-/* USER CODE END PV */
 
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_SPI1_Init(void);
-static void MX_USART1_UART_Init(void);
-static void MX_USART3_UART_Init(void);
-void TransmitTaskInit(void const * argument);
-void ReceiveTaskInit(void const * argument);
 
-uint8_t connected_dev[5] = {0x23,0x45,0x58,0x00,0x54};
-uint32_t timeout_check[5] = {0};
-uint8_t transmit_packet[7] = {0};
 
-uint32_t gateway_handle(uint8_t *rx, uint32_t size)
+uint8_t packet_build(uint8_t cmd, uint8_t *transmit_packet)
 {
-
-    if (size < 2)        // every packet must have at least cmd + dest + src
-        return 0;       // invalid, ignore
-
-    uint8_t cmd = rx[0];
-    uint8_t src = rx[1];
-
-    switch (cmd)
-    {
-    /* ============================================================
-       0x01 — CONNECT REQUEST
-       Packet: [0x01][0xFF][dev_id]
-       ============================================================*/
-    case 0x01:
-    {
-        // add device into list if needed
-        for (int i = 0; i < 5; i++)
-        {
-            if (connected_dev[i] == src)
-            {
-                uart_printf("Device %02X already connected\n", src);
-
-
-                timeout_check[i] = HAL_GetTick();
-                break;
-            }
-            else if (connected_dev[i] == 0)
-            {
-                connected_dev[i] = src;
-
-                timeout_check[i] = HAL_GetTick();
-                uart_printf("Added dev %02X\n", src);
-                break;
-            }
-        }
-        return 6;  // = 7 bytes
-    }
-
-    /* ============================================================
-       0x02 — SENSOR DATA FROM NODE
-       Packet: [0x02][0xFF][dev_id][data...]
-       ============================================================*/
-    case 0x02:
-    {
-
-        for (int i = 0;i < 5;i++)
-        {
-        	if (connected_dev[i] == src)
-        	{
-
-        		timeout_check[i] = HAL_GetTick();
-        		uint8_t buff[9];
-        		for (int j = 0; j < 9;j++)
-        		{
-        			buff[j] = rx[j+1];
-        		}
-        		send_to_esp(buff, 9);  // relay packet to ESP
-        		break;
-        	}
-        }
-
-        return 10;             // forward as-is
-    }
-    case 0x20:
-        {
-
-            for (int i = 0;i < 5;i++)
-            {
-            	if (connected_dev[i] == src)
-            	{
-
-            		timeout_check[i] = HAL_GetTick();
-            		uint8_t buff[9];
-            		for (int j = 0; j < 9;j++)
-            		{
-            			buff[j] = rx[j+2];
-            		}
-            		send_to_esp(buff, 9);  // relay packet to ESP
-            		break;
-            	}
-            }
-
-            return 11;             // forward as-is
-        }
-
-    default:
-        return 0;  // unknown command
-    }
+	switch (cmd)
+	{
+	case GATEWAY_ADV_CMD:
+		transmit_packet[0] = GATEWAY_ADV_CMD;
+		transmit_packet[1] = 0xFF;
+		for (uint8_t i = 2; i <7; i++)
+			transmit_packet[i] = connected_dev[i-2];
+	return 7;
+	case GATEWAY_BEACON_CMD:
+			transmit_packet[0] = GATEWAY_BEACON_CMD;
+			transmit_packet[1] = 0xFF;
+			transmit_packet[2] = frame++;
+			for (uint8_t i = 3; i <8; i++)
+				transmit_packet[i] = connected_dev[i-3];
+		return 8;
+	}
+return 0;
 }
+
+void packet_process(uint8_t *receive_packet, uint8_t size)
+{
+	    uint8_t cmd = receive_packet[0];
+	    uint8_t src = receive_packet[1];
+	    uint8_t node_check = 0;
+	    uint8_t slot_check = 0;
+	    uint8_t frame_check = 0;
+	    uint8_t buffer[10] = {0};
+	    switch (cmd)
+	    {
+
+	    case CONNECT_GATEWAY_CMD:
+	    {
+	        // add device into list if needed
+	        for (int i = 0; i < 5; i++)
+	        {
+	            if (connected_dev[i] == src)
+	            {
+	                uart_printf("Device %02X already connected\n", src);
+
+	                break;
+	            }
+	            else if (connected_dev[i] == 0)
+	            {
+	                connected_dev[i] = src;
+
+
+	                uart_printf("Added dev %02X\n", src);
+	                break;
+	            }
+	        }
+	       break;
+	    }
+	    case SENSOR_PACKET_CMD:
+	    	node_check = receive_packet[2];
+	    	slot_check = receive_packet[3];
+	    	frame_check = receive_packet[4];
+	    	frame_count[slot_check] = frame_check;
+	    	buffer[0] = node_check;
+	    	for (uint8_t i = 1; i < 9; i++)
+	    		buffer[i] = receive_packet[i+4];
+	    	send_to_esp(buffer, 9);
+	    	break;
+	    default:
+	       break;  // unknown command
+	    }
+}
+
 
 void gateway_timeout_check(uint32_t timeout_ms)
 {
@@ -240,77 +212,97 @@ void gateway_timeout_check(uint32_t timeout_ms)
     }
 }
 
+
+bool interval_check(uint32_t *target, uint32_t timeout)
+{
+    uint32_t current = HAL_GetTick();
+
+    if (current - *target >= timeout)
+    {
+        *target = current;
+        return true;
+    }
+    return false;
+}
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_TIM1_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
-  /* USER CODE BEGIN 1 */
 
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
-  /* USER CODE BEGIN Init */
 
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
+  MX_TIM1_Init();
+  /* USER CODE BEGIN 2 */
 
-  SX1278_hw.dio0.port =GPIOA;
-     	SX1278_hw.dio0.pin = GPIO_PIN_2;
-     	SX1278_hw.nss.port = GPIOA;
-     	SX1278_hw.nss.pin = GPIO_PIN_4;
-     	SX1278_hw.reset.port = GPIOA;
-     	SX1278_hw.reset.pin = GPIO_PIN_3;
-     	SX1278_hw.spi = &hspi1;
 
-     	SX1278.hw = &SX1278_hw;
+   SX1278_hw.dio0.port =GPIOA;
+   SX1278_hw.dio0.pin = GPIO_PIN_2;
+   SX1278_hw.nss.port = GPIOA;
+   SX1278_hw.nss.pin = GPIO_PIN_4;
+   SX1278_hw.reset.port = GPIOA;
+   SX1278_hw.reset.pin = GPIO_PIN_3;
+   SX1278_hw.spi = &hspi1;
 
-     	uart_printf("Configuring LoRa module\r\n");
-     	SX1278_init(&SX1278, 434000000, SX1278_POWER_20DBM, SX1278_LORA_SF_10,
-     	    	SX1278_LORA_BW_125KHZ, SX1278_LORA_CR_4_7, SX1278_LORA_CRC_EN, 15);
-     	uart_printf("Done configuring LoRaModule\r\n");
-     	SX1278_LoRaEntryTx(&SX1278, 16, 2000);
+    SX1278.hw = &SX1278_hw;
 
-     	osSemaphoreDef(dataReady);
-     	  dataReadyHandle = osSemaphoreCreate(osSemaphore(dataReady), 1);
-  /* definition and creation of TransmitTask */
-  osThreadDef(TransmitTask, TransmitTaskInit, 0, 0, 220);
-  TransmitTaskHandle = osThreadCreate(osThread(TransmitTask), NULL);
+    uart_printf("Configuring LoRa module\r\n");
+    SX1278_init(&SX1278, 433000000, SX1278_POWER_20DBM, SX1278_LORA_SF_7,
+    SX1278_LORA_BW_250KHZ, SX1278_LORA_CR_4_5, SX1278_LORA_CRC_EN, 15);
+    uart_printf("Done configuring LoRaModule\r\n");
+    SX1278_LoRaEntryRx(&SX1278, 16, 2000);
+    uint32_t last_adv = 0;
+    uint32_t last_beacon = 0;
+    while (1)
+    {
+    	uint8_t rx_size = rx_mode_standby(receive_packet);
+    	if (rx_size > 0)
+    	{
+    		packet_process(receive_packet, rx_size);
+    	}
 
-  /* definition and creation of ReceiveTask */
-  osThreadDef(ReceiveTask, ReceiveTaskInit, -1, 0, 380);
-  ReceiveTaskHandle = osThreadCreate(osThread(ReceiveTask), NULL);
-
-  /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-  /* USER CODE END RTOS_THREADS */
-
-  /* Start scheduler */
-  osKernelStart();
-
-  /* We should never get here as control is now taken by the scheduler */
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
+    	if (interval_check(&last_adv, 5000) )
+    	{
+    		uint8_t tx_size = packet_build(GATEWAY_ADV_CMD, transmit_packet);
+    		tx_mode_start(tx_size, 1000);
+    		tx_mode_send(transmit_packet, tx_size, 1000);
+    		rx_mode_start(10, 700);
+    	}
+    	if (interval_check(&last_beacon, 12000))
+    	    	{
+    	    		uint8_t tx_size = packet_build(GATEWAY_BEACON_CMD, transmit_packet);
+    	    		tx_mode_start(tx_size, 1000);
+    	    		tx_mode_send(transmit_packet, tx_size, 1000);
+    	    		rx_mode_start(10, 700);
+    	    	}
+    	HAL_Delay(200);
+    }
 }
 
 /**
@@ -383,6 +375,52 @@ static void MX_SPI1_Init(void)
   /* USER CODE BEGIN SPI1_Init 2 */
 
   /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
 
 }
 
@@ -497,66 +535,6 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
-
-/* USER CODE BEGIN Header_TransmitTaskInit */
-/**
-  * @brief  Function implementing the TransmitTask thread.
-  * @param  argument: Not used
-  * @retval None
-  */
-/* USER CODE END Header_TransmitTaskInit */
-void TransmitTaskInit(void const * argument)
-{
-    while (1)
-    {
-        // Wait for packet ready
-        if (osSemaphoreWait(dataReadyHandle, osWaitForever) != osOK)
-            continue;
-
-        transmit_packet[0] = 0x01;
-        for (int i=1;i<6;i++)
-        {
-        	transmit_packet[i] = connected_dev[i-1];
-        }
-
-        int ret = transmit_mode(transmit_packet, 6);
-
-
-        // Allow ReceiveTask to run next
-        osSemaphoreRelease(dataReadyHandle);
-        osDelay(500);
-    }
-}
-
-
-
-void ReceiveTaskInit(void const * argument)
-{
-    int ret;
-
-    while (1)
-    {
-        if (osSemaphoreWait(dataReadyHandle, osWaitForever) != osOK)
-            continue;
-
-        ret = receive_mode(receive_packet, sizeof(receive_packet));
-        uart_printf("[RX] receive: %d\n", ret);
-
-        if (ret > 0)
-        {
-            gateway_handle(receive_packet, ret);
-
-        }
-        else
-        {
-            uart_printf("[RX] receive failed\n");
-        }
-        gateway_timeout_check(600000);
-        osSemaphoreRelease(dataReadyHandle);
-        osDelay(200);
-    }
-}
-
 
 /**
   * @brief  Period elapsed callback in non blocking mode
