@@ -26,14 +26,14 @@
 #define NODE_BEACON (dev_id | 0x33)
 
 uint8_t frame = 0;
-uint8_t connected_dev[5] = {0x25,0x12,0x00,0x45,0x32};
-uint32_t timeout_check[5] = {0};
+uint8_t connected_dev[5] = {0x25,0x00,0x00,0x00,0x00};
+uint32_t frame_check[5] = {0};
 uint8_t transmit_packet[7] = {0};
 uint8_t receive_packet[60] = {0};
 uint8_t frame_count[5] = {0};
-#define TDMA_SLOT_TIME 2000 //2s
-#define TDMA_GUARD_TIME 200
-#define TDMA_TX_TIME    1600
+#define TDMA_SLOT_TIME 6000
+#define TDMA_GUARD_TIME 400
+
 
 
 SX1278_hw_t SX1278_hw;
@@ -112,7 +112,10 @@ uint8_t rx_mode_standby(uint8_t *packet)
         for (uint8_t i = 0; i < ret; i++)
             uart_printf("%02X ", packet[i]);
         uart_printf("\n");
-
+        if (ret > 100)
+            {
+            	rx_mode_start(60, 100);
+            }
         return ret;
     }
 
@@ -147,10 +150,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
 {
 	    uint8_t cmd = receive_packet[0];
 	    uint8_t src = receive_packet[1];
-	    uint8_t node_check = 0;
-	    uint8_t slot_check = 0;
-	    uint8_t frame_check = 0;
-	    uint8_t buffer[10] = {0};
+
 	    switch (cmd)
 	    {
 
@@ -168,7 +168,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
 	            else if (connected_dev[i] == 0)
 	            {
 	                connected_dev[i] = src;
-
+	                frame_check[i] = frame;
 
 	                uart_printf("Added dev %02X\n", src);
 	                break;
@@ -177,41 +177,34 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
 	       break;
 	    }
 	    case SENSOR_PACKET_CMD:
-	    	node_check = receive_packet[2];
-	    	slot_check = receive_packet[3];
-	    	frame_check = receive_packet[4];
-	    	frame_count[slot_check] = frame_check;
-	    	buffer[0] = node_check;
-	    	for (uint8_t i = 1; i < 9; i++)
-	    		buffer[i] = receive_packet[i+4];
-	    	send_to_esp(buffer, 9);
+	    	if (receive_packet[1] != dev_id) break;
+
+	    		uint8_t slot = receive_packet[3];
+	    		if (connected_dev[slot] == receive_packet[2]) frame_check[slot] = frame;
+
+	    	send_to_esp(receive_packet, size);
 	    	break;
+	    case FORWARD_PACKET_CMD:
+	    	if (receive_packet[1] != dev_id) break;
+
+	    	uint8_t child_slot = receive_packet[3];
+	    	if (connected_dev[child_slot] == receive_packet[2]) frame_check[child_slot] = frame;
+
+	       	send_to_esp(receive_packet, size);
+ 	    	break;
 	    default:
 	       break;  // unknown command
 	    }
 }
 
 
-void gateway_timeout_check(uint32_t timeout_ms)
+void frame_check_timeout(uint8_t * connect_stat)
 {
-     uint32_t now = HAL_GetTick();
-
-    for (int i = 0; i < 5; i++)
-    {
-        if (connected_dev[i] != 0 )
-        {
-            if ((now - timeout_check[i]) > timeout_ms)
-            {
-                uart_printf("Device %02X OFFLINE\n", connected_dev[i]);
-
-                timeout_check[i] = 0;
-
-                connected_dev[i] = 0x00;   // optional: remove
-            }
-        }
-    }
+	for (uint8_t i = 0; i < 5; i++)
+	{
+		if (frame - frame_check[i] < 5) connected_dev[i] = 0;
+	}
 }
-
 
 bool interval_check(uint32_t *target, uint32_t timeout)
 {
@@ -279,31 +272,48 @@ int main(void)
     SX1278_LoRaEntryRx(&SX1278, 16, 2000);
     uint32_t last_adv = 0;
     uint32_t last_beacon = 0;
+    uint32_t last_in_frame = 0;
+    uint8_t in_frame = 0;
+
     while (1)
     {
-    	uint8_t rx_size = rx_mode_standby(receive_packet);
-    	if (rx_size > 0)
-    	{
-    		packet_process(receive_packet, rx_size);
-    	}
+        /* ---------- RX handling ---------- */
+        uint8_t rx_size = rx_mode_standby(receive_packet);
+        if (rx_size > 0)
+        {
+            packet_process(receive_packet, rx_size);
+        }
 
-    	if (interval_check(&last_adv, 5000) )
-    	{
-    		uint8_t tx_size = packet_build(GATEWAY_ADV_CMD, transmit_packet);
-    		tx_mode_start(tx_size, 1000);
-    		tx_mode_send(transmit_packet, tx_size, 1000);
-    		rx_mode_start(10, 700);
-    	}
-    	if (interval_check(&last_beacon, 12000))
-    	    	{
-    	    		uint8_t tx_size = packet_build(GATEWAY_BEACON_CMD, transmit_packet);
-    	    		tx_mode_start(tx_size, 1000);
-    	    		tx_mode_send(transmit_packet, tx_size, 1000);
-    	    		rx_mode_start(10, 700);
-    	    	}
-    	HAL_Delay(200);
-    }
-}
+        /* ---------- BEACON: start TDMA frame ---------- */
+        if (interval_check(&last_beacon, 40000))
+        {
+            uint8_t tx_size = packet_build(GATEWAY_BEACON_CMD, transmit_packet);
+            tx_mode_start(tx_size, 1000);
+            tx_mode_send(transmit_packet, tx_size, 1000);
+            rx_mode_start(10, 700);
+
+            in_frame = 1;                 // ENTER TDMA FRAME
+            last_in_frame = HAL_GetTick(); // reset frame timer
+        }
+
+        /* ---------- ADV: ONLY when NOT in TDMA frame ---------- */
+        if (!in_frame && interval_check(&last_adv, 15000))
+        {
+            uint8_t tx_size = packet_build(GATEWAY_ADV_CMD, transmit_packet);
+            tx_mode_start(tx_size, 1000);
+            tx_mode_send(transmit_packet, tx_size, 1000);
+            rx_mode_start(10, 700);
+        }
+
+        /* ---------- TDMA frame timeout ---------- */
+        if (in_frame && interval_check(&last_in_frame, 30000))
+        {
+            in_frame = 0;   // EXIT TDMA FRAME
+        }
+
+        HAL_Delay(200);
+    }}
+
 
 /**
   * @brief System Clock Configuration
