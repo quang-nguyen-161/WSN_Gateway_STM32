@@ -10,9 +10,9 @@
 #include "SX1278.h"
 
 #define MAX_TX_PACKET_SIZE   60  // adjust as needed
-#define MAX_RX_PACKET_SIZE   60
+#define MAX_RX_PACKET_SIZE   140
 #define SENSOR_PACKET_LEN   8    // sensor fields you copy into TX (3..10 -> 8 bytes)
-#define CONNECTED_NODE_COUNT 5
+#define CONNECTED_NODE_COUNT 10
 
 #define dev_id 0xFF //gateway
 
@@ -26,12 +26,12 @@
 #define NODE_BEACON (dev_id | 0x33)
 
 uint8_t frame = 0;
-uint8_t connected_dev[5] = {0x25,0x00,0x00,0x00,0x00};
-uint32_t frame_check[5] = {0};
+uint8_t connected_dev[10] = {0x25,0x37,0x00,0x28,0x29,0x30,0x31,0x32,0x33,0x35};
+uint32_t frame_check[10] = {0};
 uint8_t transmit_packet[7] = {0};
 uint8_t receive_packet[60] = {0};
 uint8_t frame_count[5] = {0};
-#define TDMA_SLOT_TIME 6000
+#define TDMA_SLOT_TIME 3000
 #define TDMA_GUARD_TIME 400
 
 
@@ -132,16 +132,16 @@ uint8_t packet_build(uint8_t cmd, uint8_t *transmit_packet)
 	case GATEWAY_ADV_CMD:
 		transmit_packet[0] = GATEWAY_ADV_CMD;
 		transmit_packet[1] = 0xFF;
-		for (uint8_t i = 2; i <7; i++)
+		for (uint8_t i = 2; i <12; i++)
 			transmit_packet[i] = connected_dev[i-2];
-	return 7;
+	return 12;
 	case GATEWAY_BEACON_CMD:
 			transmit_packet[0] = GATEWAY_BEACON_CMD;
 			transmit_packet[1] = 0xFF;
 			transmit_packet[2] = frame++;
-			for (uint8_t i = 3; i <8; i++)
+			for (uint8_t i = 3; i <13; i++)
 				transmit_packet[i] = connected_dev[i-3];
-		return 8;
+		return 13;
 	}
 return 0;
 }
@@ -157,7 +157,7 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
 	    case CONNECT_GATEWAY_CMD:
 	    {
 	        // add device into list if needed
-	        for (int i = 0; i < 5; i++)
+	        for (int i = 0; i < 10; i++)
 	        {
 	            if (connected_dev[i] == src)
 	            {
@@ -285,7 +285,7 @@ int main(void)
         }
 
         /* ---------- BEACON: start TDMA frame ---------- */
-        if (interval_check(&last_beacon, 40000))
+        if (interval_check(&last_beacon, 65000))
         {
             uint8_t tx_size = packet_build(GATEWAY_BEACON_CMD, transmit_packet);
             tx_mode_start(tx_size, 1000);
@@ -297,7 +297,7 @@ int main(void)
         }
 
         /* ---------- ADV: ONLY when NOT in TDMA frame ---------- */
-        if (!in_frame && interval_check(&last_adv, 15000))
+        if (!in_frame && interval_check(&last_adv, 5000))
         {
             uint8_t tx_size = packet_build(GATEWAY_ADV_CMD, transmit_packet);
             tx_mode_start(tx_size, 1000);
@@ -306,7 +306,7 @@ int main(void)
         }
 
         /* ---------- TDMA frame timeout ---------- */
-        if (in_frame && interval_check(&last_in_frame, 30000))
+        if (in_frame && interval_check(&last_in_frame, 60000))
         {
             in_frame = 0;   // EXIT TDMA FRAME
         }
