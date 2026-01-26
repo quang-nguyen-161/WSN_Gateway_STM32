@@ -26,11 +26,11 @@
 #define NODE_BEACON (dev_id | 0x33)
 
 uint8_t frame = 0;
-uint8_t connected_dev[10] = {0x25,0x37,0x00,0x28,0x29,0x30,0x31,0x32,0x33,0x35};
-uint32_t frame_check[10] = {0};
+uint8_t connected_dev[10] = {0};
+uint8_t frame_check[10] = {0};
 uint8_t transmit_packet[7] = {0};
 uint8_t receive_packet[60] = {0};
-uint8_t frame_count[5] = {0};
+
 #define TDMA_SLOT_TIME 3000
 #define TDMA_GUARD_TIME 400
 
@@ -108,10 +108,13 @@ uint8_t rx_mode_standby(uint8_t *packet)
     {
         SX1278_read(&SX1278, packet, ret);
 
+       // if (packet[0] == 0x01 || packet[1] == 0xFF)
+        {
         uart_printf("[RX] Content: ");
         for (uint8_t i = 0; i < ret; i++)
             uart_printf("%02X ", packet[i]);
         uart_printf("\n");
+        }
         if (ret > 100)
             {
             	rx_mode_start(60, 100);
@@ -198,12 +201,16 @@ void packet_process(uint8_t *receive_packet, uint8_t size)
 }
 
 
-void frame_check_timeout(uint8_t * connect_stat)
+void frame_timeout_check(uint8_t *frame_timeout, uint8_t frame)
 {
-	for (uint8_t i = 0; i < 5; i++)
-	{
-		if (frame - frame_check[i] < 5) connected_dev[i] = 0;
-	}
+  for (uint8_t i = 0; i < 10; i ++)
+  {
+	  if (frame - frame_timeout[i] > 2 && (connected_dev!=0))
+	  {
+		  uart_printf("node %02X at slot %d disconnect\n",connected_dev[i],i);
+		  connected_dev[i] = 0;
+	  }
+  }
 }
 
 bool interval_check(uint32_t *target, uint32_t timeout)
@@ -283,13 +290,21 @@ int main(void)
         {
             packet_process(receive_packet, rx_size);
         }
-
+        frame_timeout_check(frame_check, frame);
         /* ---------- BEACON: start TDMA frame ---------- */
-        if (interval_check(&last_beacon, 65000))
+        if (interval_check(&last_beacon, 90000))
         {
             uint8_t tx_size = packet_build(GATEWAY_BEACON_CMD, transmit_packet);
             tx_mode_start(tx_size, 1000);
-            tx_mode_send(transmit_packet, tx_size, 1000);
+            uint8_t try = 0;
+            while (!tx_mode_send(transmit_packet, tx_size, 1000) && try < 5)
+            {
+            	try ++;
+            }
+
+
+
+
             rx_mode_start(10, 700);
 
             in_frame = 1;                 // ENTER TDMA FRAME
